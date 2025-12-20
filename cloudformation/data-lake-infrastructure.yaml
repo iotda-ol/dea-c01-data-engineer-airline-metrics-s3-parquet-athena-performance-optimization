@@ -1,0 +1,349 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Data Lake Infrastructure for Airline Metrics Analytics - DEA-C01 Compliant'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: airline-metrics-datalake
+    Description: Project name used for resource naming
+  
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name
+
+Resources:
+  # ==========================================
+  # S3 Buckets
+  # ==========================================
+  
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-raw-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: RawCSVStorage
+
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-processed-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: STANDARD_IA
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ProcessedParquetStorage
+
+  AthenaQueryResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-athena-results-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldResults
+            Status: Enabled
+            ExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: AthenaQueryResults
+
+  # ==========================================
+  # IAM Roles and Policies
+  # ==========================================
+  
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-glue-service-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${RawDataBucket.Arn}/*'
+                  - !Sub '${ProcessedDataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt RawDataBucket.Arn
+                  - !GetAtt ProcessedDataBucket.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  AthenaWorkgroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-athena-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - athena.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: AthenaS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ProcessedDataBucket.Arn
+                  - !Sub '${ProcessedDataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt AthenaQueryResultsBucket.Arn
+                  - !Sub '${AthenaQueryResultsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetPartitions
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==========================================
+  # Glue Database and Crawler
+  # ==========================================
+  
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_${Environment}'
+        Description: 'Database for airline metrics data lake'
+        LocationUri: !Sub 's3://${ProcessedDataBucket}/'
+
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-parquet-crawler-${Environment}'
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Description: 'Crawler for Parquet files in processed bucket'
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${ProcessedDataBucket}/airline_metrics/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {
+              "AddOrUpdateBehavior": "InheritFromTable"
+            }
+          },
+          "Grouping": {
+            "TableGroupingPolicy": "CombineCompatibleSchemas"
+          }
+        }
+      Tags:
+        Environment: !Ref Environment
+
+  # ==========================================
+  # Glue ETL Job
+  # ==========================================
+  
+  GlueETLJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectName}-csv-to-parquet-${Environment}'
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${ProcessedDataBucket}/scripts/csv_to_parquet_etl.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--TempDir': !Sub 's3://${ProcessedDataBucket}/temp/'
+        '--job-bookmark-option': 'job-bookmark-enable'
+        '--enable-metrics': 'true'
+        '--enable-spark-ui': 'true'
+        '--spark-event-logs-path': !Sub 's3://${ProcessedDataBucket}/spark-logs/'
+        '--enable-job-insights': 'true'
+        '--enable-glue-datacatalog': 'true'
+        '--SOURCE_S3_PATH': !Sub 's3://${RawDataBucket}/airline_metrics/'
+        '--TARGET_S3_PATH': !Sub 's3://${ProcessedDataBucket}/airline_metrics/'
+        '--DATABASE_NAME': !Ref GlueDatabase
+        '--TABLE_NAME': 'airline_metrics'
+      MaxRetries: 1
+      Timeout: 60
+      GlueVersion: '4.0'
+      NumberOfWorkers: 10
+      WorkerType: G.1X
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Tags:
+        Environment: !Ref Environment
+
+  # ==========================================
+  # Athena Workgroup
+  # ==========================================
+  
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${ProjectName}-workgroup-${Environment}'
+      Description: 'Workgroup for airline metrics queries'
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AthenaQueryResultsBucket}/query-results/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 10737418240  # 10 GB limit
+        RequesterPaysEnabled: false
+        EngineVersion:
+          SelectedEngineVersion: AUTO
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  RawDataBucketName:
+    Description: Name of the S3 bucket for raw CSV data
+    Value: !Ref RawDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-RawDataBucket'
+
+  ProcessedDataBucketName:
+    Description: Name of the S3 bucket for processed Parquet data
+    Value: !Ref ProcessedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedDataBucket'
+
+  AthenaQueryResultsBucketName:
+    Description: Name of the S3 bucket for Athena query results
+    Value: !Ref AthenaQueryResultsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaQueryResultsBucket'
+
+  GlueDatabaseName:
+    Description: Name of the Glue database
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+
+  GlueETLJobName:
+    Description: Name of the Glue ETL job
+    Value: !Ref GlueETLJob
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueETLJob'
+
+  GlueCrawlerName:
+    Description: Name of the Glue crawler
+    Value: !Ref GlueCrawler
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueCrawler'
+
+  AthenaWorkgroupName:
+    Description: Name of the Athena workgroup
+    Value: !Ref AthenaWorkgroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaWorkgroup'
+
+  GlueServiceRoleArn:
+    Description: ARN of the Glue service role
+    Value: !GetAtt GlueServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueServiceRoleArn'
