@@ -1,0 +1,24 @@
+# Python Dependencies for AWS Data Lake Project
+
+# AWS SDK
+boto3>=1.28.0
+awscli>=1.29.0
+
+# Big Data Processing
+pyspark>=3.4.0
+
+# Data Manipulation
+pandas>=2.0.3
+pyarrow>=12.0.1
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Code Quality
+black>=23.7.0
+flake8>=6.0.0
+mypy>=1.4.0
+
+# Utilities
+python-dotenv>=1.0.0
